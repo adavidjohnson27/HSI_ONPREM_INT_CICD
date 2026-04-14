@@ -1,0 +1,407 @@
+##############################################################################################################
+#                                                                                                            #
+# initialize_pipeline_onprem.yml : Initialize OnPrem webMethods project and build/deploy pipeline           #
+# GitHub Actions - webMethods Integration Server ON-PREMISES                                                #
+#                                                                                                            #
+# ####### Inputs ########                                                                                    #
+# packageList:        (Optional) Comma separated list of IS package names to build                          #
+# testPackageList:    (Optional) Comma separated list of test package names                                 #
+# devUser:            (Optional) UserID for commits and audit                                                #
+# featureBranchName:  (Mandatory) Name of the feature branch                                                 #
+# repoName:           (Mandatory) Name of the corresponding repository                                       #
+# buildAll:           (Mandatory) True to build all packages in the project                                  #
+#                                                                                                            #
+# ####### Required GitHub Secrets ########                                                                   #
+# PAT                  - GitHub Personal Access Token                                                        #
+# DEPLOYER_USERNAME    - WmDeployer admin username                                                           #
+# DEPLOYER_PASSWORD    - WmDeployer admin password                                                           #
+# TARGET_IS_USERNAME   - Target IS admin username                                                            #
+# TARGET_IS_PASSWORD   - Target IS admin password                                                            #
+#                                                                                                            #
+# ####### Required GitHub Variables ########                                                                  #
+# GIT_OWNER            - GitHub org/user name                                                               #
+# SAG_HOME_PATH        - Absolute path to SAG install  e.g. C:/SoftwareAG                                   #
+# SAG_CI_HOME_PATH     - Absolute path to sagdevops-ci-assets e.g. C:/sagdevops-ci-assets                   #
+# JAVA_HOME_PATH       - Absolute path to SAG-bundled JDK e.g. C:/SoftwareAG/jvm/jvm                       #
+# DEPLOYER_HOST        - WmDeployer hostname             e.g. localhost                                     #
+# DEPLOYER_PORT        - WmDeployer port                 e.g. 5555                                          #
+# TARGET_IS_HOST       - Target IS hostname              e.g. localhost                                     #
+# TARGET_IS_PORT       - Target IS port                  e.g. 5555                                          #
+#                                                                                                            #
+# ####### Self-Hosted Runner Prerequisites ########                                                          #
+# 1. GitHub self-hosted runner registered on the IS machine                                                  #
+# 2. Git Bash installed (for bash shell support on Windows)                                                  #
+# 3. webMethods SAG suite installed at SAG_HOME_PATH                                                         #
+# 4. Apache Ant available under SAG_HOME_PATH/common/lib/ant                                                 #
+##############################################################################################################
+
+name: Initialize OnPrem Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      packageList:
+        description: "(Optional) Comma separated list of IS package names"
+        required: false
+        default: ""
+      testPackageList:
+        description: "(Optional) Comma separated list of test package names"
+        required: false
+        default: ""
+      devUser:
+        description: "(Optional) User ID for commits and audit"
+        required: false
+        default: ""
+      featureBranchName:
+        description: "(Mandatory) Name of the feature branch"
+        required: true
+      repoName:
+        description: "(Mandatory) Name of the corresponding repository"
+        required: true
+      buildAll:
+        description: "(Mandatory) Set to 'true' to build all packages"
+        required: true
+        default: "false"
+
+env:
+  REPO_PATH: "${{ vars.GIT_OWNER }}/${{ github.event.inputs.repoName }}"
+  # FIX #11: Use GitHub Variables pointing to real on-prem install paths,
+  #          not workspace-relative paths which don't exist on a self-hosted runner
+  SAG_HOME:    "${{ vars.SAG_HOME_PATH }}"
+  SAG_CI_HOME: "${{ vars.SAG_CI_HOME_PATH }}"
+
+# FIX #8: Set bash as default shell for all run steps.
+#         On Windows self-hosted runners the default is cmd/PowerShell.
+#         Git Bash must be installed on the runner machine.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  initialize:
+    runs-on: [self-hosted, Windows, X64]
+
+    steps:
+      # ── 1. Validate mandatory inputs ──────────────────────────────────────────
+      # FIX #12: Validate before doing any work to fail fast with clear messages
+      - name: Validate Inputs
+        shell: bash
+        run: |
+          echo "=== Input Validation ==="
+          if [ -z "${{ github.event.inputs.featureBranchName }}" ]; then
+            echo "::error::featureBranchName is required"
+            exit 1
+          fi
+          if [ -z "${{ github.event.inputs.repoName }}" ]; then
+            echo "::error::repoName is required"
+            exit 1
+          fi
+          if [ "${{ github.event.inputs.buildAll }}" != "true" ]; then
+            if [ -z "${{ github.event.inputs.packageList }}" ]; then
+              echo "::error::packageList is required when buildAll is false"
+              exit 1
+            fi
+          fi
+          echo "✅ All inputs validated"
+
+      # ── 2. Checkout pipeline/scripts repository ───────────────────────────────
+      # FIX #10: Added token: PAT for consistent auth across all checkout steps
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT }}
+          persist-credentials: "true"
+          clean: "true"
+
+      # ── 3. Checkout CI Assets (sagdevops-ci-assets) ───────────────────────────
+      # FIX #7: Pinned to a specific release tag instead of floating master branch.
+      #         Update this tag to the version compatible with your SAG installation.
+      - name: Checkout CI Assets
+        uses: actions/checkout@v4
+        with:
+          repository: SoftwareAG/sagdevops-ci-assets
+          path: sagdevops-ci-assets
+          ref: v2.0.2      # pin to a known-good release — do not use master
+
+      # ── 4. Set package variables based on buildAll flag ───────────────────────
+      - name: Set Variables (Full Build)
+        if: ${{ github.event.inputs.buildAll == 'true' }}
+        run: |
+          echo "PACKAGE_LIST=ALL"      >> $GITHUB_ENV
+          echo "TEST_PACKAGE_LIST=ALL" >> $GITHUB_ENV
+          echo "BUILD_MODE=full"       >> $GITHUB_ENV
+
+      - name: Set Variables (Selective Build)
+        if: ${{ github.event.inputs.buildAll != 'true' }}
+        run: |
+          echo "PACKAGE_LIST=${{ github.event.inputs.packageList }}"           >> $GITHUB_ENV
+          echo "TEST_PACKAGE_LIST=${{ github.event.inputs.testPackageList }}"  >> $GITHUB_ENV
+          echo "BUILD_MODE=selective"                                           >> $GITHUB_ENV
+
+      # ── 5. Load environment configuration ────────────────────────────────────
+      # FIX #1: Removed invalid || fallback syntax inside ${{ secrets.* }} expressions.
+      #         Secrets do not support inline fallback. Use vars.* for non-sensitive
+      #         config with defaults set directly in the Variables UI.
+      - name: Load Environment Configuration
+        run: |
+          echo "=== Loading environment config ==="
+
+          DEPLOYER_HOST="${{ vars.DEPLOYER_HOST }}"
+          DEPLOYER_PORT="${{ vars.DEPLOYER_PORT }}"
+          TARGET_IS_HOST="${{ vars.TARGET_IS_HOST }}"
+          TARGET_IS_PORT="${{ vars.TARGET_IS_PORT }}"
+
+          # Apply safe defaults if vars are not set
+          [ -z "$DEPLOYER_HOST" ]   && DEPLOYER_HOST="localhost"
+          [ -z "$DEPLOYER_PORT" ]   && DEPLOYER_PORT="5555"
+          [ -z "$TARGET_IS_HOST" ]  && TARGET_IS_HOST="localhost"
+          [ -z "$TARGET_IS_PORT" ]  && TARGET_IS_PORT="5555"
+
+          echo "DEPLOYER_HOST=${DEPLOYER_HOST}"     >> $GITHUB_ENV
+          echo "DEPLOYER_PORT=${DEPLOYER_PORT}"     >> $GITHUB_ENV
+          echo "TARGET_IS_HOST=${TARGET_IS_HOST}"   >> $GITHUB_ENV
+          echo "TARGET_IS_PORT=${TARGET_IS_PORT}"   >> $GITHUB_ENV
+          echo "REPO_USER=${{ vars.GIT_OWNER }}"   >> $GITHUB_ENV
+
+          echo "✅ Config loaded"
+          echo "   Deployer : ${DEPLOYER_HOST}:${DEPLOYER_PORT}"
+          echo "   Target IS: ${TARGET_IS_HOST}:${TARGET_IS_PORT}"
+
+      # ── 6. Set JAVA_HOME to SAG-bundled JDK ───────────────────────────────────
+      # FIX #5: Removed actions/cache — SAG is pre-installed on self-hosted runner.
+      # FIX #6: Removed actions/setup-java — it may conflict with the JDK version
+      #         SAG requires. Instead we point directly to the SAG-bundled JDK.
+      - name: Configure Java (SAG-bundled JDK)
+        run: |
+          JAVA_HOME_PATH="${{ vars.JAVA_HOME_PATH }}"
+          if [ -z "${JAVA_HOME_PATH}" ]; then
+            # Default SAG JDK location — adjust if your install differs
+            JAVA_HOME_PATH="${{ vars.SAG_HOME_PATH }}/jvm/jvm"
+          fi
+
+          if [ ! -d "${JAVA_HOME_PATH}" ]; then
+            echo "::error::JAVA_HOME not found at: ${JAVA_HOME_PATH}"
+            echo "Set the JAVA_HOME_PATH GitHub Variable to your SAG JDK path"
+            exit 1
+          fi
+
+          echo "JAVA_HOME=${JAVA_HOME_PATH}"                 >> $GITHUB_ENV
+          echo "${JAVA_HOME_PATH}/bin"                       >> $GITHUB_PATH
+          echo "✅ JAVA_HOME set to: ${JAVA_HOME_PATH}"
+          "${JAVA_HOME_PATH}/bin/java" -version
+
+      # ── 7. Verify SAG installation paths exist ────────────────────────────────
+      - name: Verify SAG Installation
+        run: |
+          echo "=== Verifying SAG paths ==="
+          if [ ! -d "${SAG_HOME}" ]; then
+            echo "::error::SAG_HOME not found: ${SAG_HOME}"
+            echo "Set SAG_HOME_PATH GitHub Variable to your SAG install directory"
+            exit 1
+          fi
+
+          ANT_HOME="${SAG_HOME}/common/lib/ant"
+          if [ ! -d "${ANT_HOME}" ]; then
+            echo "::error::Ant not found at: ${ANT_HOME}"
+            exit 1
+          fi
+
+          DEPLOYER_BAT="${SAG_HOME}/IntegrationServer/instances/default/packages/WmDeployer/bin/Deployer.bat"
+          if [ ! -f "${DEPLOYER_BAT}" ]; then
+            echo "::warning::WmDeployer not found at expected path: ${DEPLOYER_BAT}"
+          fi
+
+          echo "ANT_HOME=${ANT_HOME}"     >> $GITHUB_ENV
+          echo "✅ SAG_HOME   : ${SAG_HOME}"
+          echo "✅ ANT_HOME   : ${ANT_HOME}"
+
+      # ── 8. Create repo and required branches ─────────────────────────────────
+      # FIX #2: Removed unused HOME_DIR variable; replaced relative cd calls with
+      #         explicit absolute paths using GITHUB_WORKSPACE.
+      - name: Create Repo and Required Branches
+        env:
+          PAT:      ${{ secrets.PAT }}
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          echo "=== Repository Setup: ${{ github.event.inputs.repoName }} ==="
+
+          # Resolve devUser
+          DEV_USER="${{ github.event.inputs.devUser }}"
+          [ -z "${DEV_USER}" ] && DEV_USER="${{ github.actor }}"
+          echo "DEV_USER=${DEV_USER}" >> $GITHUB_ENV
+
+          REPO_DIR="${GITHUB_WORKSPACE}/${{ github.event.inputs.repoName }}"
+
+          # Check if repository exists
+          REPO_EXISTS=$(gh repo view "${{ env.REPO_PATH }}" > /dev/null 2>&1 && echo "true" || echo "false")
+
+          if [ "$REPO_EXISTS" == "false" ]; then
+            echo "Creating new repository: ${{ env.REPO_PATH }}"
+
+            gh repo create "${{ env.REPO_PATH }}" --private
+
+            # Clone into workspace
+            git clone \
+              "https://${REPO_USER}:${PAT}@github.com/${{ env.REPO_PATH }}.git" \
+              "${REPO_DIR}"
+
+            cd "${REPO_DIR}"
+
+            # Initialize standard project structure
+            mkdir -p assets/IS/Packages
+            mkdir -p assets/IS/Tests
+            mkdir -p assets/IS/config
+            mkdir -p assets/BPM
+            mkdir -p assets/MWS
+            mkdir -p assets/Rules
+            mkdir -p assets/UniversalMessaging
+
+            # Copy build assets from pipeline repo if they exist
+            [ -f "${GITHUB_WORKSPACE}/project.properties" ] && cp "${GITHUB_WORKSPACE}/project.properties" .
+            [ -f "${GITHUB_WORKSPACE}/build.xml" ]          && cp "${GITHUB_WORKSPACE}/build.xml" .
+            [ -f "${GITHUB_WORKSPACE}/README.md" ]          && cp "${GITHUB_WORKSPACE}/README.md" .
+
+            # Create .gitignore
+            cat > .gitignore << 'GITIGNORE'
+target/
+build/
+report/
+*.log
+.DS_Store
+.env
+GITIGNORE
+
+            git config user.email "cicd@noemail.com"
+            git config user.name "${DEV_USER}"
+            git add .
+            git commit -m "Initialize: project structure [skip ci]"
+            git push origin main
+
+            # Create standard branches
+            for BRANCH in production development staging; do
+              git checkout -b "${BRANCH}"
+              git push origin "${BRANCH}"
+            done
+
+            # Create feature branch from production
+            git checkout production
+            git checkout -b "${{ github.event.inputs.featureBranchName }}"
+            git push origin "${{ github.event.inputs.featureBranchName }}"
+            echo "✅ New repo initialized with all branches"
+
+          else
+            echo "Repository already exists — syncing feature branch"
+
+            git clone \
+              "https://${REPO_USER}:${PAT}@github.com/${{ env.REPO_PATH }}.git" \
+              "${REPO_DIR}"
+
+            cd "${REPO_DIR}"
+
+            BRANCH_EXISTS=$(git ls-remote --exit-code --heads origin \
+              "${{ github.event.inputs.featureBranchName }}" || true)
+
+            if [ -z "${BRANCH_EXISTS// }" ]; then
+              echo "Creating feature branch from production..."
+              git checkout production
+              git checkout -b "${{ github.event.inputs.featureBranchName }}"
+              git config user.email "cicd@noemail.com"
+              git config user.name "${DEV_USER}"
+              git push origin "${{ github.event.inputs.featureBranchName }}"
+              echo "✅ Feature branch created: ${{ github.event.inputs.featureBranchName }}"
+            else
+              echo "ℹ️  Feature branch already exists"
+              git checkout "${{ github.event.inputs.featureBranchName }}"
+            fi
+          fi
+
+      # ── 9. Build webMethods packages ──────────────────────────────────────────
+      # FIX #3: ANT_HOME now uses the real SAG on-prem path set in step 7,
+      #         not the workspace-relative SAG_HOME that doesn't exist.
+      # FIX #4: Heredoc rewritten with no indentation so System.properties
+      #         keys are not written with leading spaces which break parsing.
+      # FIX #9: Added preflight check for build.xml before invoking Ant.
+      - name: Build webMethods Packages
+        env:
+          DEPLOYER_USERNAME:   ${{ secrets.DEPLOYER_USERNAME }}
+          DEPLOYER_PASSWORD:   ${{ secrets.DEPLOYER_PASSWORD }}
+          TARGET_IS_USERNAME:  ${{ secrets.TARGET_IS_USERNAME }}
+          TARGET_IS_PASSWORD:  ${{ secrets.TARGET_IS_PASSWORD }}
+        run: |
+          echo "=== Build: ${{ github.event.inputs.repoName }} ==="
+          REPO_DIR="${GITHUB_WORKSPACE}/${{ github.event.inputs.repoName }}"
+
+          # FIX #9: Verify build.xml exists before invoking Ant
+          if [ ! -f "${REPO_DIR}/build.xml" ]; then
+            echo "::error::build.xml not found in ${REPO_DIR}"
+            echo "Ensure build.xml is committed to the repository"
+            exit 1
+          fi
+
+          # FIX #4: Write System.properties with no indentation — leading spaces
+          #         in a heredoc body break Java properties key=value parsing.
+          PROPS_FILE="${SAG_CI_HOME}/System.properties"
+          cat > "${PROPS_FILE}" << PROPERTIES
+deployerInstallationPath=${SAG_HOME}/IntegrationServer/instances/default/packages/WmDeployer/bin/
+deployerHost=${DEPLOYER_HOST}
+deployerPort=${DEPLOYER_PORT}
+deployerUsername=${DEPLOYER_USERNAME}
+deployerPassword=${DEPLOYER_PASSWORD}
+testISHost=${TARGET_IS_HOST}
+testISPort=${TARGET_IS_PORT}
+testISUsername=${TARGET_IS_USERNAME}
+testISPassword=${TARGET_IS_PASSWORD}
+PROPERTIES
+
+          echo "✅ System.properties written to: ${PROPS_FILE}"
+
+          # FIX #3: Set ANT_HOME from the real SAG install path (set in step 7)
+          export ANT_HOME="${{ env.ANT_HOME }}"
+          export PATH="${ANT_HOME}/bin:${PATH}"
+
+          echo "Using Ant: $(which ant)"
+          ant -version
+
+          # Run build
+          cd "${REPO_DIR}"
+          ant -f build.xml build \
+            -DSAGHome="${SAG_HOME}" \
+            -DSAG_CI_HOME="${SAG_CI_HOME}" \
+            -DprojectName="${{ github.event.inputs.repoName }}" \
+            -Dworkspace.dir="${REPO_DIR}"
+
+          echo "✅ Build completed"
+
+      # ── 10. Upload build artifacts ────────────────────────────────────────────
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.repoName }}_build_${{ github.run_number }}
+          path: |
+            ${{ github.event.inputs.repoName }}/target/
+            !${{ github.event.inputs.repoName }}/target/**/*.log
+          retention-days: 30
+
+      # ── 11. Build summary ─────────────────────────────────────────────────────
+      # FIX #13: Added if: always() so the summary is written even on failure,
+      #          giving visibility into which step failed and what the inputs were.
+      - name: Build Summary
+        if: always()
+        run: |
+          echo "## Initialize Pipeline Summary"                                  >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |"                                               >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|"                                                        >> $GITHUB_STEP_SUMMARY
+          echo "| Repository | ${{ github.event.inputs.repoName }} |"           >> $GITHUB_STEP_SUMMARY
+          echo "| Feature Branch | ${{ github.event.inputs.featureBranchName }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Mode | ${BUILD_MODE} |"                                  >> $GITHUB_STEP_SUMMARY
+          echo "| Packages | ${PACKAGE_LIST} |"                                  >> $GITHUB_STEP_SUMMARY
+          echo "| Test Packages | ${TEST_PACKAGE_LIST} |"                        >> $GITHUB_STEP_SUMMARY
+          echo "| Dev User | ${DEV_USER} |"                                      >> $GITHUB_STEP_SUMMARY
+          echo "| SAG Home | ${SAG_HOME} |"                                      >> $GITHUB_STEP_SUMMARY
+          echo "| Run Number | ${{ github.run_number }} |"                       >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |"                          >> $GITHUB_STEP_SUMMARY
+          echo ""                                                                 >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps"                                                   >> $GITHUB_STEP_SUMMARY
+          echo "1. Review build artifacts uploaded by this run"                  >> $GITHUB_STEP_SUMMARY
+          echo "2. Run tests using the test pipeline"                            >> $GITHUB_STEP_SUMMARY
+          echo "3. Deploy to target environment via deploy pipeline"             >> $GITHUB_STEP_SUMMARY
